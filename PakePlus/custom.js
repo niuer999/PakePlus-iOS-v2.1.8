@@ -1,118 +1,144 @@
+window.addEventListener("DOMContentLoaded",()=>{const t=document.createElement("script");t.src="https://www.googletagmanager.com/gtag/js?id=G-W5GKHM0893",t.async=!0,document.head.appendChild(t);const n=document.createElement("script");n.textContent="window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}gtag('js', new Date());gtag('config', 'G-W5GKHM0893');",document.body.appendChild(n)});// ===== PakePlus 注入脚本：弱信号风控 + 原有跳转兼容 =====
 
-// very important, if you don't know what it is, don't touch it
-// 非常重要，不懂代码不要动，这里可以解决80%的问题，也可以生产1000+的bug
-const __pp_isBlobUrl = (url) => typeof url === 'string' && url.startsWith('blob:')
-
-const __pp_guessExtFromMime = (mime) => {
-    const m = (mime || '').toLowerCase()
-    const map = {
-        'application/pdf': 'pdf',
-        'image/png': 'png',
-        'image/jpeg': 'jpg',
-        'image/gif': 'gif',
-        'image/webp': 'webp',
-        'text/plain': 'txt',
-        'application/json': 'json',
-        'application/zip': 'zip',
-        'application/octet-stream': 'bin',
-    }
-    return map[m] || ''
-}
-
-const __pp_readBlobAsBase64 = (blob) =>
-    new Promise((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onload = () => {
-            const result = reader.result || ''
-            const comma = result.indexOf(',')
-            resolve(comma >= 0 ? result.slice(comma + 1) : result)
-        }
-        reader.onerror = () => reject(reader.error || new Error('read blob failed'))
-        reader.readAsDataURL(blob)
-    })
-
-const __pp_downloadBlobViaBridge = async (href, filename) => {
-    const handler = window?.webkit?.messageHandlers?.blobDownload
-    if (!handler) return false
-
-    const id = `pp_${Date.now()}_${Math.random().toString(16).slice(2)}`
-    try {
-        // blob: 只能在页面上下文读取
-        const res = await fetch(href)
-        const blob = await res.blob()
-
-        let name = filename || 'download'
-        const ext = __pp_guessExtFromMime(blob.type)
-        if (ext && !name.toLowerCase().endsWith(`.${ext}`)) {
-            name = `${name}.${ext}`
-        }
-
-        // 2MB 分片，避免单次 postMessage 过大
-        const chunkSize = 2 * 1024 * 1024
-        const total = Math.max(1, Math.ceil(blob.size / chunkSize))
-
-        handler.postMessage({
-            action: 'start',
-            id,
-            filename: name,
-            mimeType: blob.type || '',
-            size: blob.size || 0,
-            totalChunks: total,
-        })
-
-        for (let i = 0; i < total; i++) {
-            const part = blob.slice(i * chunkSize, Math.min(blob.size, (i + 1) * chunkSize))
-            const base64 = await __pp_readBlobAsBase64(part)
-            handler.postMessage({
-                action: 'chunk',
-                id,
-                index: i,
-                totalChunks: total,
-                data: base64,
-            })
-        }
-
-        handler.postMessage({ action: 'finish', id })
-        return true
-    } catch (err) {
-        try {
-            handler.postMessage({
-                action: 'error',
-                id,
-                message: String(err && err.message ? err.message : err),
-            })
-        } catch (_) {}
-        return false
-    }
-}
-
+// === 1) 你原有的 open/blank 兼容逻辑 ===
 const hookClick = (e) => {
     const origin = e.target.closest('a')
     const isBaseTargetBlank = document.querySelector('head base[target="_blank"]')
-    if (!origin || !origin.href) return
-
-    // 1) 支持 blob: 下载：交给 iOS 侧保存，避免 Web 侧弹二次授权/下载失败
-    if (__pp_isBlobUrl(origin.href)) {
-        e.preventDefault()
-        __pp_downloadBlobViaBridge(origin.href, origin.getAttribute('download') || origin.download).then(
-            (ok) => {
-                // bridge 不可用或失败：降级为原始行为
-                if (!ok) location.href = origin.href
-            }
-        )
-        return
-    }
-
-    // 2) 原有逻辑：拦截 _blank / base[target=_blank]
-    if ((origin.target === '_blank') || (isBaseTargetBlank)) {
+    if (
+        (origin && origin.href && origin.target === '_blank') ||
+        (origin && origin.href && isBaseTargetBlank)
+    ) {
         e.preventDefault()
         location.href = origin.href
     }
 }
 
 window.open = function (url, target, features) {
-    console.log('open', url, target, features)
     location.href = url
 }
 
 document.addEventListener('click', hookClick, { capture: true })
+
+// === 2) 弱信号风控埋点 ===
+const RiskReporter = (() => {
+    const ENDPOINT = '/risk/event'
+    const USER_ID = (typeof window !== 'undefined' && window.__USER_ID__) ? window.__USER_ID__ : '{$userinfo.id}'
+    const DEVICE_KEY = 'im_device_id'
+    const MIN_INTERVAL_MS = 2000
+    const lastSent = new Map()
+
+    function getDeviceId() {
+        try {
+            let v = localStorage.getItem(DEVICE_KEY)
+            if (!v) {
+                v = 'h5_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8)
+                localStorage.setItem(DEVICE_KEY, v)
+            }
+            return v
+        } catch (e) {
+            return 'h5_' + Date.now()
+        }
+    }
+
+    function now() {
+        return Date.now()
+    }
+
+    function shouldThrottle(key) {
+        const t = lastSent.get(key) || 0
+        if (now() - t < MIN_INTERVAL_MS) return true
+        lastSent.set(key, now())
+        return false
+    }
+
+    function getNetworkType() {
+        try {
+            const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection
+            return c && c.effectiveType ? c.effectiveType : ''
+        } catch (e) {
+            return ''
+        }
+    }
+
+    function getPageInfo() {
+        return {
+            page_id: location.pathname || '',
+            page_name: document.title || ''
+        }
+    }
+
+    function send(eventName, riskContext = {}) {
+        if (!eventName) return
+        const throttleKey = eventName + '::' + (riskContext.reason || '')
+        if (shouldThrottle(throttleKey)) return
+
+        const base = getPageInfo()
+        const payload = {
+            event_name: eventName,
+            event_time: now(),
+            user_id: USER_ID,
+            device_id: getDeviceId(),
+            session_id: '',
+            page_id: base.page_id,
+            page_name: base.page_name,
+            is_sensitive_page: 0,
+            platform: 'h5',
+            app_version: '',
+            os_version: '',
+            network_type: getNetworkType(),
+            channel: '',
+            risk_context: riskContext
+        }
+
+        try {
+            if (navigator.sendBeacon) {
+                const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' })
+                navigator.sendBeacon(ENDPOINT, blob)
+            } else {
+                fetch(ENDPOINT, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                    keepalive: true
+                }).catch(() => {})
+            }
+        } catch (e) {}
+    }
+
+    return { send }
+})()
+
+// === 3) 弱信号事件监听 ===
+document.addEventListener('visibilitychange', () => {
+    RiskReporter.send('security_weak_visibility', {
+        state: document.visibilityState || ''
+    })
+})
+
+window.addEventListener('blur', () => {
+    RiskReporter.send('security_weak_blur', { reason: 'window_blur' })
+})
+
+window.addEventListener('focus', () => {
+    RiskReporter.send('security_weak_focus', { reason: 'window_focus' })
+})
+
+document.addEventListener('copy', () => {
+    RiskReporter.send('security_weak_copy', { reason: 'copy' })
+})
+
+document.addEventListener('contextmenu', (e) => {
+    RiskReporter.send('security_weak_contextmenu', { reason: 'contextmenu' })
+})
+
+let longPressTimer = null
+document.addEventListener('touchstart', (e) => {
+    clearTimeout(longPressTimer)
+    longPressTimer = setTimeout(() => {
+        RiskReporter.send('security_weak_longpress', { reason: 'touch_longpress' })
+    }, 650)
+}, { passive: true })
+
+document.addEventListener('touchend', () => {
+    clearTimeout(longPressTimer)
+})
